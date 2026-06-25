@@ -72,10 +72,7 @@ func stripFrameHeader(t *testing.T, frame []byte) (blocks []byte, windowSize uin
 	}
 	ws := h.WindowSize
 	if h.SingleSegment {
-		ws = h.FrameContentSize
-		if ws < MinWindowSize {
-			ws = MinWindowSize
-		}
+		ws = max(h.FrameContentSize, MinWindowSize)
 	}
 	body := frame[h.HeaderSize:]
 	if h.HasCheckSum {
@@ -316,10 +313,7 @@ func proveBoundary(t *testing.T, frame []byte, infos []blockInfo, full []byte, b
 }
 
 func firstDiff(a, b []byte) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
+	n := min(len(b), len(a))
 	for i := 0; i < n; i++ {
 		if a[i] != b[i] {
 			return i
@@ -434,10 +428,7 @@ func stationaryContent(n int) []byte {
 	alpha := []byte("etaoinshrdlcumwfgypbvkjxqz0123456789 ,.")
 	weights := make([]byte, 0, 1024)
 	for i, c := range alpha {
-		w := 40 - i
-		if w < 1 {
-			w = 1
-		}
+		w := max(40-i, 1)
 		for j := 0; j < w; j++ {
 			weights = append(weights, c)
 		}
@@ -446,10 +437,7 @@ func stationaryContent(n int) []byte {
 	for len(out) < n {
 		if len(out) > 64 && r.intn(5) == 0 {
 			L := 3 + r.intn(8)
-			start := len(out) - (4 + r.intn(60))
-			if start < 0 {
-				start = 0
-			}
+			start := max(len(out)-(4+r.intn(60)), 0)
 			for j := 0; j < L && start+j < len(out); j++ {
 				out = append(out, out[start+j])
 			}
@@ -481,7 +469,7 @@ func pick(s []int, n int) []int {
 	}
 	out := make([]int, 0, n)
 	step := float64(len(s)) / float64(n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		out = append(out, s[int(float64(i)*step)])
 	}
 	return out
@@ -1092,7 +1080,7 @@ func rleProneContent(n int) []byte {
 	const matchLen = 64 // fixed -> RLE match-length distribution
 	for len(out) < n {
 		litLen := 2 + r.intn(6)
-		for j := 0; j < litLen; j++ {
+		for range litLen {
 			out = append(out, alpha[r.intn(len(alpha))])
 		}
 		start := r.intn(len(seed) - matchLen)
@@ -1235,9 +1223,9 @@ func TestWindowDescriptor_Edges(t *testing.T) {
 	}
 	// The exact representable window sizes, in increasing order, must each map to
 	// their own descriptor (smallest covering), and want-1 must too.
-	for exp := uint8(0); exp < 20; exp++ {
+	for exp := range uint8(20) {
 		base := uint64(1) << (10 + uint(exp))
-		for mant := uint8(0); mant < 8; mant++ {
+		for mant := range uint8(8) {
 			want := base + (base/8)*uint64(mant)
 			wd := windowDescriptor(want)
 			got := decode(wd)
@@ -1499,7 +1487,7 @@ func pickCheckpoints(cps []Checkpoint, n int) []Checkpoint {
 	}
 	out := make([]Checkpoint, 0, n)
 	step := float64(len(cps)) / float64(n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		out = append(out, cps[int(float64(i)*step)])
 	}
 	return out

@@ -386,10 +386,7 @@ func firstFrame(frame []byte) (frameInfo, error) {
 	}
 	ws := h.WindowSize
 	if h.SingleSegment {
-		ws = h.FrameContentSize
-		if ws < MinWindowSize {
-			ws = MinWindowSize
-		}
+		ws = max(h.FrameContentSize, MinWindowSize)
 	}
 	after := frame[h.HeaderSize:]
 	streamLen, err := blockStreamLen(after)
@@ -754,10 +751,10 @@ func buildResumeFrame(dictID uint32, windowSize uint64, suffix []byte) []byte {
 // 1<<windowLog; add = (windowBase/8)*(wd&7); window = windowBase + add. A
 // want above the format maximum is clamped to the maximum descriptor.
 func windowDescriptor(want uint64) byte {
-	for exp := uint8(0); exp < 32; exp++ {
+	for exp := range uint8(32) {
 		windowLog := 10 + uint(exp)
 		windowBase := uint64(1) << windowLog
-		for mant := uint8(0); mant < 8; mant++ {
+		for mant := range uint8(8) {
 			window := windowBase + (windowBase/8)*uint64(mant)
 			if window >= want {
 				return (exp << 3) | mant
