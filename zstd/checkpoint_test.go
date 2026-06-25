@@ -314,7 +314,7 @@ func proveBoundary(t *testing.T, frame []byte, infos []blockInfo, full []byte, b
 
 func firstDiff(a, b []byte) int {
 	n := min(len(b), len(a))
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if a[i] != b[i] {
 			return i
 		}
@@ -429,7 +429,7 @@ func stationaryContent(n int) []byte {
 	weights := make([]byte, 0, 1024)
 	for i, c := range alpha {
 		w := max(40-i, 1)
-		for j := 0; j < w; j++ {
+		for range w {
 			weights = append(weights, c)
 		}
 	}
