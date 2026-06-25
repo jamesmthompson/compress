@@ -75,16 +75,23 @@ type Checkpoint struct {
 	// block BlockIndex first.
 	BlockIndex int
 
-	// CompressedOffset is the byte offset, within the original frame, of the
-	// first block that resuming decodes. It is the start of the boundary's
-	// blocks: original[CompressedOffset:] (minus any trailing checksum) are the
-	// blocks ResumeFrame replays.
+	// CompressedOffset is the byte offset, within the input frame, of the first
+	// block that resuming decodes. The blocks ResumeFrame replays are exactly
+	// input[CompressedOffset:FrameCompressedSize] of the original input, minus the
+	// frame's trailing content checksum if it has one.
 	CompressedOffset int
 
-	// UncompressedOffset is the number of decoded bytes the original frame
-	// produces before the boundary. A full decode of the original frame and the
-	// decode of ResumeFrame agree from this offset onward.
+	// UncompressedOffset is the number of decoded bytes the frame produces before
+	// the boundary. A full decode of the frame and the decode of ResumeFrame agree
+	// from this offset onward.
 	UncompressedOffset int
+
+	// FrameCompressedSize is the total compressed length of the frame the
+	// checkpoint belongs to: the frame header, its block stream, and its content
+	// checksum if present. It is the byte offset, within the input, where this
+	// frame ends and the next frame (if any) begins. A caller checkpointing a
+	// multi-frame input advances with input[FrameCompressedSize:].
+	FrameCompressedSize int
 
 	// Dictionary is a standard zstd dictionary (magic 0xEC30A437) describing the
 	// decoder state at the boundary: the active Huffman and FSE tables, the three
@@ -93,15 +100,24 @@ type Checkpoint struct {
 	Dictionary []byte
 
 	// ResumeFrame is a self-contained single zstd frame: a synthesized header
-	// declaring the dictionary and the original frame's window, followed by the
-	// blocks from CompressedOffset to the end of the original frame. Decoding it
-	// with Dictionary registered yields the original frame's tail.
+	// declaring the dictionary and the frame's window, followed by the blocks from
+	// CompressedOffset to the end of the frame's block stream (never its checksum
+	// or any trailing data). Decoding it with Dictionary registered yields exactly
+	// the frame's tail from UncompressedOffset onward.
 	ResumeFrame []byte
 }
 
-// CheckpointAt captures a Checkpoint at the boundary before block blockIndex of a
-// single zstd frame. blockIndex must be >= 1 (block 0 begins at frame start,
-// which needs no checkpoint) and at most the number of blocks in the frame.
+// CheckpointAt captures a Checkpoint at the boundary before block blockIndex of
+// the first zstd frame at the start of frame. The valid range of blockIndex is
+// [1, N-1] where N is the number of blocks in the frame: block 0 begins at frame
+// start (which needs no checkpoint) and the boundary after the last block (N)
+// resumes nothing. A blockIndex outside this range returns an error.
+//
+// If frame contains more than one frame, or a trailing checksum or other trailing
+// bytes, only the first frame is used: the captured ResumeFrame replays exactly
+// the first frame's blocks and nothing past its end. Checkpoint.FrameCompressedSize
+// reports where the first frame ends so a caller can checkpoint the next frame
+// with frame[FrameCompressedSize:].
 //
 // dictID is the dictionary ID stamped into the emitted dictionary and the replay
 // frame; it must be non-zero (the format reserves ID 0 to mean "no dictionary").
@@ -109,10 +125,7 @@ type Checkpoint struct {
 // stable per-frame ID.
 //
 // It returns ErrCheckpointNotSerializable (use errors.Is) if the boundary cannot
-// be expressed as a standard dictionary (see that error). frame must be a single
-// zstd frame; a frame carrying a content checksum is accepted (the checksum
-// covers the whole frame and is dropped from the replay frame, which decodes only
-// the tail).
+// be expressed as a standard dictionary (see that error).
 func CheckpointAt(frame []byte, dictID uint32, blockIndex int) (Checkpoint, error) {
 	if dictID == 0 {
 		return Checkpoint{}, errors.New("zstd: dictionary ID must be non-zero")
@@ -120,22 +133,27 @@ func CheckpointAt(frame []byte, dictID uint32, blockIndex int) (Checkpoint, erro
 	if blockIndex < 1 {
 		return Checkpoint{}, fmt.Errorf("zstd: block index %d must be >= 1", blockIndex)
 	}
-	body, windowSize, headerLen, err := frameBody(frame)
+	fi, err := firstFrame(frame)
 	if err != nil {
 		return Checkpoint{}, err
 	}
 
 	var result Checkpoint
 	var found bool
-	walkErr := walkCheckpoints(body, windowSize, func(cp checkpointState) error {
+	walkErr := walkCheckpoints(fi.body, fi.windowSize, func(cp checkpointState) error {
 		if cp.blockIndex != blockIndex {
 			return nil
+		}
+		if cp.compOffset >= len(fi.body) {
+			// End-of-frame boundary: there are no further blocks to resume, so this
+			// is not a valid checkpoint.
+			return fmt.Errorf("zstd: block index %d is the end of the frame; valid range is [1, %d]", blockIndex, blockIndex-1)
 		}
 		dictBlob, err := encodeCheckpointDict(dictID, cp)
 		if err != nil {
 			return err
 		}
-		result = assembleCheckpoint(dictID, cp, dictBlob, body, headerLen, windowSize)
+		result = assembleCheckpoint(dictID, cp, dictBlob, fi)
 		found = true
 		return errStopWalk
 	})
@@ -149,10 +167,16 @@ func CheckpointAt(frame []byte, dictID uint32, blockIndex int) (Checkpoint, erro
 }
 
 // Checkpoints captures, in a single forward decode, a Checkpoint at every
-// interior block boundary of frame whose following block reuses entropy and is
-// therefore serializable as a standard dictionary. Boundaries that reuse an RLE
-// entropy table (see ErrCheckpointNotSerializable) are skipped, not returned as
-// errors: the result is the set of usable resume points.
+// interior block boundary of the first zstd frame at the start of frame whose
+// following block reuses entropy and is therefore serializable as a standard
+// dictionary. Boundaries that cannot be expressed as a dictionary (see
+// ErrCheckpointNotSerializable) are skipped, not returned as errors: the result
+// is the set of usable resume points.
+//
+// If frame contains more than one frame, or a trailing checksum or other trailing
+// bytes, only the first frame is used. Every returned Checkpoint reports the same
+// FrameCompressedSize, the byte offset where the first frame ends; a caller
+// checkpointing a multi-frame input advances with frame[FrameCompressedSize:].
 //
 // Every boundary is a valid resume point in principle, but only entropy-reusing
 // boundaries require a dictionary to carry the codebook; a boundary whose next
@@ -166,14 +190,14 @@ func Checkpoints(frame []byte, dictID uint32) ([]Checkpoint, error) {
 	if dictID == 0 {
 		return nil, errors.New("zstd: dictionary ID must be non-zero")
 	}
-	body, windowSize, headerLen, err := frameBody(frame)
+	fi, err := firstFrame(frame)
 	if err != nil {
 		return nil, err
 	}
 
 	var out []Checkpoint
-	err = walkCheckpoints(body, windowSize, func(cp checkpointState) error {
-		if cp.blockIndex == 0 || !cp.reusesEntropy {
+	err = walkCheckpoints(fi.body, fi.windowSize, func(cp checkpointState) error {
+		if cp.blockIndex == 0 || !cp.reusesEntropy || cp.compOffset >= len(fi.body) {
 			return nil
 		}
 		dictBlob, encErr := encodeCheckpointDict(dictID, cp)
@@ -183,7 +207,7 @@ func Checkpoints(frame []byte, dictID uint32) ([]Checkpoint, error) {
 		if encErr != nil {
 			return encErr
 		}
-		out = append(out, assembleCheckpoint(dictID, cp, dictBlob, body, headerLen, windowSize))
+		out = append(out, assembleCheckpoint(dictID, cp, dictBlob, fi))
 		return nil
 	})
 	if err != nil {
@@ -305,14 +329,17 @@ func walkCheckpoints(body []byte, windowSize uint64, fn func(checkpointState) er
 
 // assembleCheckpoint packages a serialized dictionary and a captured state into a
 // Checkpoint, building the self-contained replay frame for the boundary's blocks.
-func assembleCheckpoint(dictID uint32, cp checkpointState, dictBlob, body []byte, headerLen int, windowSize uint64) Checkpoint {
-	suffix := body[cp.compOffset:]
+// The replay frame embeds only the first frame's blocks (fi.body is already bounded
+// to the first frame's block stream), never its checksum or any trailing data.
+func assembleCheckpoint(dictID uint32, cp checkpointState, dictBlob []byte, fi frameInfo) Checkpoint {
+	suffix := fi.body[cp.compOffset:]
 	return Checkpoint{
-		BlockIndex:         cp.blockIndex,
-		CompressedOffset:   headerLen + cp.compOffset,
-		UncompressedOffset: cp.uncompOffset,
-		Dictionary:         dictBlob,
-		ResumeFrame:        buildResumeFrame(dictID, windowSize, suffix),
+		BlockIndex:          cp.blockIndex,
+		CompressedOffset:    fi.headerLen + cp.compOffset,
+		UncompressedOffset:  cp.uncompOffset,
+		FrameCompressedSize: fi.frameLen,
+		Dictionary:          dictBlob,
+		ResumeFrame:         buildResumeFrame(dictID, fi.windowSize, suffix),
 	}
 }
 
@@ -320,16 +347,29 @@ func assembleCheckpoint(dictID uint32, cp checkpointState, dictBlob, body []byte
 // Frame / block header parsing (header-only; no payload decode).
 // ---------------------------------------------------------------------------
 
-// frameBody returns the raw block stream of a single zstd frame (the frame body
-// with no frame header and no trailing content checksum), the frame's window
-// size, and the length of the frame header in bytes.
-func frameBody(frame []byte) (body []byte, windowSize uint64, headerLen int, err error) {
+// frameInfo describes the first zstd frame at the start of an input.
+type frameInfo struct {
+	body       []byte // the block stream only: no header, no checksum, no trailing data
+	windowSize uint64
+	headerLen  int // length of the frame header in bytes
+	frameLen   int // total compressed length of the first frame (header + blocks + checksum)
+}
+
+// firstFrame parses the first zstd frame at the start of frame and bounds the
+// block stream to exactly that frame, ignoring any trailing checksum, trailing
+// frames, or trailing bytes. frame may contain more than one frame; only the
+// first is described.
+//
+// The block stream is found by scanning block headers (no payload decode) until
+// the Last block, so body ends precisely at the first frame's last block and
+// never includes its content checksum or any byte at or past the frame's end.
+func firstFrame(frame []byte) (frameInfo, error) {
 	var h Header
 	if err := h.Decode(frame); err != nil {
-		return nil, 0, 0, err
+		return frameInfo{}, err
 	}
 	if h.Skippable {
-		return nil, 0, 0, errors.New("zstd: skippable frame has no blocks")
+		return frameInfo{}, errors.New("zstd: first frame is skippable and has no blocks")
 	}
 	ws := h.WindowSize
 	if h.SingleSegment {
@@ -338,14 +378,60 @@ func frameBody(frame []byte) (body []byte, windowSize uint64, headerLen int, err
 			ws = MinWindowSize
 		}
 	}
-	b := frame[h.HeaderSize:]
-	if h.HasCheckSum {
-		if len(b) < 4 {
-			return nil, 0, 0, errors.New("zstd: frame too short for checksum")
-		}
-		b = b[:len(b)-4]
+	after := frame[h.HeaderSize:]
+	streamLen, err := blockStreamLen(after)
+	if err != nil {
+		return frameInfo{}, err
 	}
-	return b, ws, h.HeaderSize, nil
+	crcLen := 0
+	if h.HasCheckSum {
+		crcLen = 4
+		if len(after) < streamLen+4 {
+			return frameInfo{}, errors.New("zstd: frame too short for checksum")
+		}
+	}
+	return frameInfo{
+		body:       after[:streamLen],
+		windowSize: ws,
+		headerLen:  h.HeaderSize,
+		frameLen:   h.HeaderSize + streamLen + crcLen,
+	}, nil
+}
+
+// blockStreamLen returns the byte length of the block stream at the start of in:
+// the bytes from the first block header up to and including the body of the Last
+// block. It parses block headers only and never decodes payload. Any bytes after
+// the Last block (a content checksum, further frames, or trailing data) are not
+// counted.
+func blockStreamLen(in []byte) (int, error) {
+	off := 0
+	for {
+		if off+3 > len(in) {
+			return 0, errors.New("zstd: truncated block header")
+		}
+		bh := uint32(in[off]) | uint32(in[off+1])<<8 | uint32(in[off+2])<<16
+		last := bh&1 != 0
+		typ := blockType((bh >> 1) & 3)
+		cSize := int(bh >> 3)
+		bodyStart := off + 3
+		var bodyLen int
+		switch typ {
+		case blockTypeRaw, blockTypeCompressed:
+			bodyLen = cSize
+		case blockTypeRLE:
+			bodyLen = 1
+		default:
+			return 0, errors.New("zstd: reserved block type")
+		}
+		end := bodyStart + bodyLen
+		if end > len(in) {
+			return 0, errors.New("zstd: truncated block body")
+		}
+		off = end
+		if last {
+			return off, nil
+		}
+	}
 }
 
 // blockReusesEntropy reports, from a block's header only, whether decoding it

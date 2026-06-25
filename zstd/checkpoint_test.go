@@ -719,3 +719,220 @@ func TestCheckpoint_RLEFailsClosed(t *testing.T) {
 		t.Fatalf("encodeCheckpointDict with RLE offset table: got %v, want ErrCheckpointNotSerializable", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Trailing-data and multi-frame inputs: capture must bound to the first frame.
+// ---------------------------------------------------------------------------
+
+// encodeFrame produces a single zstd frame for content, with or without a content
+// checksum, at SpeedBestCompression with a 1 MiB window.
+func encodeFrame(t *testing.T, content []byte, crc bool) []byte {
+	t.Helper()
+	enc, err := NewWriter(nil,
+		WithEncoderLevel(SpeedBestCompression),
+		WithEncoderCRC(crc),
+		WithWindowSize(1<<20),
+	)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	out := enc.EncodeAll(content, nil)
+	if err := enc.Close(); err != nil {
+		t.Fatalf("enc.Close: %v", err)
+	}
+	return out
+}
+
+// skippableFrameBytes builds a minimal skippable frame carrying payload.
+func skippableFrameBytes(payload []byte) []byte {
+	out := []byte{0x50, 0x2a, 0x4d, 0x18} // user magic 0x184D2A50 (LE), nibble 0
+	var sz [4]byte
+	binary.LittleEndian.PutUint32(sz[:], uint32(len(payload)))
+	out = append(out, sz[:]...)
+	return append(out, payload...)
+}
+
+// assertResumesFirstFrameOnly captures checkpoints in input (which begins with
+// frame A possibly followed by trailing bytes/frames) and asserts every resume
+// yields exactly frame A's tail -- never bytes from past frame A's end. fullA is
+// an independent full decode of frame A alone.
+func assertResumesFirstFrameOnly(t *testing.T, input, fullA []byte, frameALen int) {
+	t.Helper()
+
+	cps, err := Checkpoints(input, 0xABCDEF01)
+	if err != nil {
+		t.Fatalf("Checkpoints: %v", err)
+	}
+	if len(cps) == 0 {
+		t.Fatalf("Checkpoints returned none")
+	}
+	for _, cp := range cps {
+		if cp.FrameCompressedSize != frameALen {
+			t.Fatalf("FrameCompressedSize = %d, want %d (frame A end)", cp.FrameCompressedSize, frameALen)
+		}
+		dec, err := NewReader(nil, WithDecoderDicts(cp.Dictionary))
+		if err != nil {
+			t.Fatalf("NewReader: %v", err)
+		}
+		tail, err := dec.DecodeAll(cp.ResumeFrame, nil)
+		dec.Close()
+		if err != nil {
+			t.Fatalf("DecodeAll(ResumeFrame) at block %d: %v", cp.BlockIndex, err)
+		}
+		want := fullA[cp.UncompressedOffset:]
+		if len(tail) != len(want) {
+			t.Fatalf("block %d: resumed tail length %d != frame A tail length %d (decoded past frame A?)",
+				cp.BlockIndex, len(tail), len(want))
+		}
+		if !bytes.Equal(tail, want) {
+			t.Fatalf("block %d: resumed tail mismatch; firstDiff=%d", cp.BlockIndex, firstDiff(tail, want))
+		}
+	}
+
+	// CheckpointAt on the same input agrees, including for an interior boundary.
+	blocksA, _, _, _ := stripFrameHeader(t, input[:frameALen])
+	reuse := findReuseBoundaries(walkBlocks(t, blocksA))
+	if len(reuse) == 0 {
+		t.Fatalf("frame A has no reuse boundary")
+	}
+	cp, err := CheckpointAt(input, 0xABCDEF01, reuse[0])
+	if err != nil {
+		t.Fatalf("CheckpointAt: %v", err)
+	}
+	if cp.FrameCompressedSize != frameALen {
+		t.Fatalf("CheckpointAt FrameCompressedSize = %d, want %d", cp.FrameCompressedSize, frameALen)
+	}
+	dec, _ := NewReader(nil, WithDecoderDicts(cp.Dictionary))
+	defer dec.Close()
+	tail, err := dec.DecodeAll(cp.ResumeFrame, nil)
+	if err != nil {
+		t.Fatalf("CheckpointAt DecodeAll: %v", err)
+	}
+	if !bytes.Equal(tail, fullA[cp.UncompressedOffset:]) {
+		t.Fatalf("CheckpointAt tail mismatch at block %d", cp.BlockIndex)
+	}
+}
+
+// TestCheckpoint_ConcatenatedCRCFrames: input is frame A (with checksum) followed
+// by frame B. Capture must bound to frame A; resume must not decode frame B.
+func TestCheckpoint_ConcatenatedCRCFrames(t *testing.T) {
+	contentA := mixedContent(t)
+	frameA := encodeFrame(t, contentA, true)
+	frameB := encodeFrame(t, stationaryContent(50000), true)
+	input := append(append([]byte{}, frameA...), frameB...)
+
+	fullA := fullDecode(t, frameA)
+	assertResumesFirstFrameOnly(t, input, fullA, len(frameA))
+}
+
+// TestCheckpoint_ConcatenatedNoCRCFrames is the critical silent-wrong-bytes case:
+// frame A has NO content checksum, so the byte after frame A's last block is
+// frame B's magic. A capture that did not bound to frame A would decode frame B
+// too and silently return too many bytes with no error.
+func TestCheckpoint_ConcatenatedNoCRCFrames(t *testing.T) {
+	contentA := mixedContent(t)
+	frameA := encodeFrame(t, contentA, false)
+	frameB := encodeFrame(t, stationaryContent(50000), false)
+	input := append(append([]byte{}, frameA...), frameB...)
+
+	fullA := fullDecode(t, frameA)
+	assertResumesFirstFrameOnly(t, input, fullA, len(frameA))
+}
+
+// TestCheckpoint_TrailingSkippableFrame: frame A (no checksum) followed by a
+// skippable frame. Resume must stop at frame A's end, not trip on the skippable
+// magic.
+func TestCheckpoint_TrailingSkippableFrame(t *testing.T) {
+	contentA := mixedContent(t)
+	frameA := encodeFrame(t, contentA, false)
+	skip := skippableFrameBytes([]byte("trailing skippable payload, ignore me"))
+	input := append(append([]byte{}, frameA...), skip...)
+
+	fullA := fullDecode(t, frameA)
+	assertResumesFirstFrameOnly(t, input, fullA, len(frameA))
+}
+
+// TestCheckpoint_TrailingGarbageByte: a single valid frame plus one trailing byte
+// must still resume to exactly the frame's tail.
+func TestCheckpoint_TrailingGarbageByte(t *testing.T) {
+	contentA := mixedContent(t)
+	frameA := encodeFrame(t, contentA, true)
+	input := append(append([]byte{}, frameA...), 0x7e)
+
+	fullA := fullDecode(t, frameA)
+	assertResumesFirstFrameOnly(t, input, fullA, len(frameA))
+}
+
+// TestCheckpoint_NextFrameComposable: FrameCompressedSize lets a caller advance to
+// the next frame and checkpoint it too.
+func TestCheckpoint_NextFrameComposable(t *testing.T) {
+	frameA := encodeFrame(t, mixedContent(t), true)
+	frameB := encodeFrame(t, mixedContent(t), false)
+	input := append(append([]byte{}, frameA...), frameB...)
+
+	cpsA, err := Checkpoints(input, 1)
+	if err != nil {
+		t.Fatalf("Checkpoints A: %v", err)
+	}
+	if len(cpsA) == 0 {
+		t.Fatalf("no checkpoints for frame A")
+	}
+	aEnd := cpsA[0].FrameCompressedSize
+	if aEnd != len(frameA) {
+		t.Fatalf("frame A end = %d, want %d", aEnd, len(frameA))
+	}
+
+	// Advance to frame B and checkpoint it.
+	cpsB, err := Checkpoints(input[aEnd:], 2)
+	if err != nil {
+		t.Fatalf("Checkpoints B: %v", err)
+	}
+	if len(cpsB) == 0 {
+		t.Fatalf("no checkpoints for frame B")
+	}
+	fullB := fullDecode(t, frameB)
+	cp := cpsB[0]
+	dec, _ := NewReader(nil, WithDecoderDicts(cp.Dictionary))
+	defer dec.Close()
+	tail, err := dec.DecodeAll(cp.ResumeFrame, nil)
+	if err != nil {
+		t.Fatalf("DecodeAll frame B resume: %v", err)
+	}
+	if !bytes.Equal(tail, fullB[cp.UncompressedOffset:]) {
+		t.Fatalf("frame B tail mismatch at block %d", cp.BlockIndex)
+	}
+}
+
+// TestCheckpointAt_EndOfFrameRejected: blockIndex == number of blocks (the
+// end-of-frame boundary) resumes nothing and must be rejected with an error
+// rather than yield a header-only ResumeFrame that fails to decode.
+func TestCheckpointAt_EndOfFrameRejected(t *testing.T) {
+	frame := encodeKlauspost(t, SpeedBestCompression, mixedContent(t))
+	blocks, _, _, _ := stripFrameHeader(t, frame)
+	infos := walkBlocks(t, blocks)
+	nBlocks := len(infos)
+
+	if _, err := CheckpointAt(frame, 1, nBlocks); err == nil {
+		t.Fatalf("CheckpointAt(blockIndex=nBlocks=%d) should be rejected", nBlocks)
+	}
+	if _, err := CheckpointAt(frame, 1, nBlocks+1); err == nil {
+		t.Fatalf("CheckpointAt(blockIndex=%d) past end should be rejected", nBlocks+1)
+	}
+	// The last valid interior boundary still works.
+	if nBlocks >= 2 {
+		if _, err := CheckpointAt(frame, 1, nBlocks-1); err != nil {
+			t.Fatalf("CheckpointAt(blockIndex=%d) should succeed: %v", nBlocks-1, err)
+		}
+	}
+
+	// Checkpoints never emits the end-of-frame boundary.
+	cps, err := Checkpoints(frame, 1)
+	if err != nil {
+		t.Fatalf("Checkpoints: %v", err)
+	}
+	for _, cp := range cps {
+		if cp.BlockIndex >= nBlocks {
+			t.Fatalf("Checkpoints emitted end-of-frame boundary at block %d (nBlocks=%d)", cp.BlockIndex, nBlocks)
+		}
+	}
+}
