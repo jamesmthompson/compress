@@ -593,12 +593,14 @@ func TestCheckpointAt_RealCLILayer(t *testing.T) {
 }
 
 // TestCheckpoints_OnePass proves the one-pass Checkpoints emits a checkpoint at
-// every entropy-reusing boundary, each of which resumes byte-identically, and
-// that its boundary set matches an independent header walk.
+// every serializable interior boundary -- fresh and reuse alike -- each of which
+// resumes byte-identically, and that the only boundaries it omits are the
+// reused-RLE-mode ones it cannot serialize.
 func TestCheckpoints_OnePass(t *testing.T) {
 	frame := encodeKlauspost(t, SpeedBestCompression, mixedContent(t))
 	blocks, _, _, _ := stripFrameHeader(t, frame)
 	infos := walkBlocks(t, blocks)
+	nBlocks := len(infos)
 	full := fullDecode(t, frame)
 
 	cps, err := Checkpoints(frame, 0x12345678)
@@ -608,10 +610,22 @@ func TestCheckpoints_OnePass(t *testing.T) {
 	if len(cps) == 0 {
 		t.Fatalf("Checkpoints returned none")
 	}
-	t.Logf("Checkpoints emitted %d resume points", len(cps))
+	t.Logf("Checkpoints emitted %d resume points over %d blocks", len(cps), nBlocks)
 
-	// Every emitted checkpoint resumes byte-identically through the public path.
+	// Every emitted checkpoint is an interior boundary [1, nBlocks-1] and resumes
+	// byte-identically through the public path.
+	got := map[int]bool{}
+	freshCount, reuseCount := 0, 0
 	for _, cp := range cps {
+		if cp.BlockIndex < 1 || cp.BlockIndex >= nBlocks {
+			t.Fatalf("Checkpoints emitted out-of-range boundary %d (nBlocks=%d)", cp.BlockIndex, nBlocks)
+		}
+		got[cp.BlockIndex] = true
+		if infos[cp.BlockIndex].reusesEntropy() {
+			reuseCount++
+		} else {
+			freshCount++
+		}
 		dec, err := NewReader(nil, WithDecoderDicts(cp.Dictionary))
 		if err != nil {
 			t.Fatalf("NewReader: %v", err)
@@ -626,17 +640,85 @@ func TestCheckpoints_OnePass(t *testing.T) {
 				cp.BlockIndex, firstDiff(tail, full[cp.UncompressedOffset:]))
 		}
 	}
+	t.Logf("emitted boundaries: %d fresh, %d reuse", freshCount, reuseCount)
 
-	// The emitted set is a subset of every interior reuse boundary (the rest, if
-	// any, were RLE-reuse and correctly skipped).
-	got := map[int]bool{}
-	for _, cp := range cps {
-		got[cp.BlockIndex] = true
+	// Fresh boundaries are now included: a real corpus has interior blocks that
+	// define their own entropy, and those are valid, always-serializable resume
+	// points.
+	if freshCount == 0 {
+		t.Fatalf("expected at least one fresh boundary in the result, got none")
 	}
+
+	// Completeness: every interior boundary is included UNLESS it is a CheckpointAt
+	// failure (only the reused-RLE-mode case). A boundary CheckpointAt serializes
+	// must be present in the Checkpoints result.
+	for k := 1; k < nBlocks; k++ {
+		_, atErr := CheckpointAt(frame, 0x12345678, k)
+		serializable := atErr == nil
+		if serializable && !got[k] {
+			t.Fatalf("Checkpoints omitted serializable interior boundary %d", k)
+		}
+		if !serializable {
+			if !errors.Is(atErr, ErrCheckpointNotSerializable) {
+				t.Fatalf("CheckpointAt(%d) unexpected error: %v", k, atErr)
+			}
+			if got[k] {
+				t.Fatalf("Checkpoints emitted non-serializable boundary %d", k)
+			}
+		}
+	}
+}
+
+// TestCheckpoints_IncludesFreshBoundaries proves the density change: Checkpoints
+// now returns fresh boundaries (next block defines its own entropy), not only
+// entropy-reusing ones. It asserts that on a real corpus the result contains
+// strictly more checkpoints than the reuse-only subset, that at least one fresh
+// boundary is present, and that every returned checkpoint -- fresh and reuse --
+// resumes byte-identically.
+func TestCheckpoints_IncludesFreshBoundaries(t *testing.T) {
+	frame := encodeKlauspost(t, SpeedBestCompression, mixedContent(t))
+	blocks, _, _, _ := stripFrameHeader(t, frame)
+	infos := walkBlocks(t, blocks)
+	full := fullDecode(t, frame)
+
+	// The old contract returned only entropy-reusing interior boundaries.
+	reuseOnly := 0
+	for k := 1; k < len(infos); k++ {
+		if infos[k].reusesEntropy() {
+			reuseOnly++
+		}
+	}
+
+	cps, err := Checkpoints(frame, 0x44444444)
+	if err != nil {
+		t.Fatalf("Checkpoints: %v", err)
+	}
+
+	fresh := 0
 	for _, cp := range cps {
 		if !infos[cp.BlockIndex].reusesEntropy() {
-			t.Fatalf("Checkpoints emitted a non-reuse boundary at block %d", cp.BlockIndex)
+			fresh++
 		}
+		dec, err := NewReader(nil, WithDecoderDicts(cp.Dictionary))
+		if err != nil {
+			t.Fatalf("NewReader: %v", err)
+		}
+		tail, derr := dec.DecodeAll(cp.ResumeFrame, nil)
+		dec.Close()
+		if derr != nil {
+			t.Fatalf("resume block %d: %v", cp.BlockIndex, derr)
+		}
+		if !bytes.Equal(tail, full[cp.UncompressedOffset:]) {
+			t.Fatalf("fresh/reuse tail mismatch at block %d", cp.BlockIndex)
+		}
+	}
+	t.Logf("Checkpoints=%d (reuse-only would be %d), fresh boundaries included=%d", len(cps), reuseOnly, fresh)
+
+	if fresh == 0 {
+		t.Fatalf("expected fresh boundaries to be included, got none")
+	}
+	if len(cps) <= reuseOnly {
+		t.Fatalf("Checkpoints (%d) should exceed the reuse-only count (%d)", len(cps), reuseOnly)
 	}
 }
 
@@ -1126,6 +1208,14 @@ func TestCheckpoints_ReusedRLEFSE_ZstdCLI(t *testing.T) {
 	}
 	if _, err := CheckpointAt(frame, 0x99, rleBoundary); !errors.Is(err, ErrCheckpointNotSerializable) {
 		t.Fatalf("CheckpointAt on RLE-mode FSE boundary %d: got %v, want ErrCheckpointNotSerializable", rleBoundary, err)
+	}
+
+	// (c) Even though Checkpoints now returns fresh boundaries too, the
+	// non-serializable RLE-reuse boundary is still excluded from the result.
+	for _, cp := range cps {
+		if cp.BlockIndex == rleBoundary {
+			t.Fatalf("Checkpoints emitted the non-serializable RLE-reuse boundary %d", rleBoundary)
+		}
 	}
 }
 

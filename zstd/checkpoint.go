@@ -172,25 +172,28 @@ func CheckpointAt(frame []byte, dictID uint32, blockIndex int) (Checkpoint, erro
 }
 
 // Checkpoints captures, in a single forward decode, a Checkpoint at every
-// interior block boundary of the first zstd frame at the start of frame whose
-// following block reuses entropy and is therefore serializable as a standard
-// dictionary. Boundaries that cannot be expressed as a dictionary (see
-// ErrCheckpointNotSerializable) are skipped, not returned as errors: the result
-// is the set of usable resume points.
+// interior block boundary of the first zstd frame at the start of frame that can
+// be expressed as a standard dictionary. This is every interior boundary except
+// the ones whose following block reuses an RLE-mode FSE table (see
+// ErrCheckpointNotSerializable); those are skipped, not returned as errors, so the
+// result is the full set of usable resume points.
+//
+// Both kinds of boundary are included. A fresh boundary -- one whose next block
+// redefines its own entropy tables -- still needs the back-reference window and
+// the three recent offsets to resume, and the dictionary carries exactly those
+// (the entropy tables it also carries are simply unused by the next block); it is
+// the cheapest checkpoint and is always serializable. A reuse boundary -- one
+// whose next block reuses an established Huffman or FSE table -- additionally needs
+// that codebook, which the dictionary carries too. Only a reused RLE-mode FSE
+// table has no dictionary representation, which is the lone excluded case.
 //
 // If frame contains more than one frame, or a trailing checksum or other trailing
 // bytes, only the first frame is used. Every returned Checkpoint reports the same
 // FrameCompressedSize, the byte offset where the first frame ends; a caller
 // checkpointing a multi-frame input advances with frame[FrameCompressedSize:].
 //
-// Every boundary is a valid resume point in principle, but only entropy-reusing
-// boundaries require a dictionary to carry the codebook; a boundary whose next
-// block redefines all of its tables can be resumed from window and offsets alone.
-// Checkpoints reports the boundaries that genuinely need -- and can be expressed
-// as -- a dictionary, which is the set a random-access index records. dictID is
-// stamped into every emitted dictionary and replay frame; it must be non-zero.
-//
-// The cost is one decode of the frame, not one per boundary.
+// dictID is stamped into every emitted dictionary and replay frame; it must be
+// non-zero. The cost is one decode of the frame, not one per boundary.
 func Checkpoints(frame []byte, dictID uint32) ([]Checkpoint, error) {
 	if dictID == 0 {
 		return nil, errors.New("zstd: dictionary ID must be non-zero")
@@ -202,11 +205,16 @@ func Checkpoints(frame []byte, dictID uint32) ([]Checkpoint, error) {
 
 	var out []Checkpoint
 	err = walkCheckpoints(fi.body, fi.windowSize, func(cp checkpointState) error {
-		if cp.blockIndex == 0 || !cp.reusesEntropy || cp.compOffset >= len(fi.body) {
+		// Skip the frame-start boundary (block 0, nothing to seed) and the
+		// end-of-frame boundary (nothing left to resume). Every interior boundary
+		// is a candidate, fresh or reuse alike.
+		if cp.blockIndex == 0 || cp.compOffset >= len(fi.body) {
 			return nil
 		}
 		dictBlob, encErr := encodeCheckpointDict(dictID, cp)
 		if errors.Is(encErr, ErrCheckpointNotSerializable) {
+			// Only a reused RLE-mode FSE table reaches here; that boundary cannot be
+			// a standard dictionary, so skip it. Fresh boundaries always serialize.
 			return nil
 		}
 		if encErr != nil {
