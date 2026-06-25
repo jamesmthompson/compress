@@ -43,17 +43,22 @@ import (
 // three FSE tables, each as an explicit multi-symbol distribution, so a boundary
 // is not serializable when either:
 //
-//   - a reused entropy table is RLE (a single symbol). The format has no
-//     representation for a single-symbol table, so it cannot be written without
+//   - a reused FSE table is in RLE mode (a single-symbol table). The format has
+//     no representation for an RLE table, so it cannot be written without
 //     producing a dictionary that decodes to the wrong bytes; or
 //   - no Huffman table has been established yet (every preceding block used Raw
 //     or RLE literals), so there is no table to carry.
 //
-// Capture fails closed with this error rather than emit a wrong dictionary. Both
-// cases arise only on near-degenerate inputs; on ordinary data the encoder builds
-// multi-symbol or predefined tables and every entropy-reusing boundary is
-// serializable. A caller scanning a frame for resume points treats this error as
-// "this boundary is not a checkpoint" and moves on; Checkpoints does exactly that.
+// These are not rare. Real `zstd -19` over natural text routinely reuses an RLE
+// literal-length FSE table across interior blocks, so many boundaries of an
+// ordinary text frame are not serializable. Such boundaries simply do not become
+// checkpoints, which lowers checkpoint density on that content; the resume points
+// that Checkpoints does return are unaffected.
+//
+// Capture fails closed with this error rather than emit a wrong dictionary -- no
+// wrong bytes, ever. A caller scanning a frame for resume points treats it as
+// "this boundary is not a checkpoint" and moves on; Checkpoints does exactly that,
+// returning the usable subset. Match with errors.Is, as it may be wrapped.
 var ErrCheckpointNotSerializable = errors.New("zstd: checkpoint not representable as a standard dictionary")
 
 // A Checkpoint marks a block boundary inside a single zstd frame from which
@@ -599,8 +604,9 @@ func compressedReusesEntropy(in []byte) (bool, error) {
 // match-length, literal-length, in that order, per the format), three 4-byte LE
 // offsets, then the window content. loadDict parses it straight back.
 //
-// It returns ErrCheckpointNotSerializable if any reused FSE table is RLE
-// (single-symbol), which the dictionary format cannot represent.
+// It returns ErrCheckpointNotSerializable (possibly wrapped, so match with
+// errors.Is) if any reused FSE table is in RLE mode, which the multi-symbol
+// dictionary header cannot represent.
 func encodeCheckpointDict(dictID uint32, cp checkpointState) ([]byte, error) {
 	if cp.huff == nil {
 		// No Huffman table has been established by the boundary (every preceding
@@ -658,13 +664,23 @@ func encodeCheckpointDict(dictID uint32, cp checkpointState) ([]byte, error) {
 // way back populates exactly those, so a decoder round-trips through the header
 // with no information loss. A predefined table is emitted explicitly as its
 // normalized distribution (the format has no "predefined" marker but the same
-// counts rebuild the same table). A single-symbol RLE table cannot be written as
-// a multi-symbol header and yields ErrCheckpointNotSerializable.
+// counts rebuild the same table).
+//
+// An RLE table (a single-symbol table) cannot be written as a multi-symbol header
+// and yields ErrCheckpointNotSerializable. RLE is detected by actualTableLog == 0,
+// which is what fseDecoder.setRLE reliably sets; symbolLen is NOT a safe signal,
+// because setRLE leaves it at whatever the preceding multi-symbol table had (an
+// observed RLE litlength table carries symbolLen=3, actualTableLog=0). As a final
+// belt-and-suspenders guard, any other writeCount failure -- which can only be a
+// table this distribution cannot be expressed as -- is also mapped to the public
+// sentinel, so a raw internal error never escapes the checkpoint API.
 func fseDecoderToHeader(dec *fseDecoder) ([]byte, error) {
 	if dec == nil {
 		return nil, errors.New("zstd: nil FSE decoder")
 	}
-	if dec.symbolLen <= 1 {
+	if dec.actualTableLog == 0 || dec.symbolLen <= 1 {
+		// RLE / degenerate table: a single-symbol distribution the multi-symbol
+		// dictionary header cannot represent.
 		return nil, ErrCheckpointNotSerializable
 	}
 	var enc fseEncoder
@@ -678,7 +694,10 @@ func fseDecoderToHeader(dec *fseDecoder) ([]byte, error) {
 	enc.useRLE = false
 	out, err := enc.writeCount(nil)
 	if err != nil {
-		return nil, fmt.Errorf("zstd: writeCount: %w", err)
+		// A surviving writeCount error is a distribution the dictionary format
+		// cannot carry; surface it as the documented sentinel, never as a raw
+		// internal error.
+		return nil, ErrCheckpointNotSerializable
 	}
 	return out, nil
 }

@@ -936,3 +936,195 @@ func TestCheckpointAt_EndOfFrameRejected(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Reused RLE-mode FSE tables: fail closed as the sentinel, never a raw error.
+// ---------------------------------------------------------------------------
+
+// TestFSEDecoderToHeader_RLEFailsClosed is the deterministic proof for the
+// reused-RLE-mode FSE table case. fseDecoder.setRLE sets actualTableLog == 0 and
+// leaves symbolLen at whatever the preceding multi-symbol table had, so the old
+// symbolLen <= 1 guard missed it and writeCount then underflowed with a raw
+// internal error. Detection keys on actualTableLog == 0, the field setRLE sets.
+func TestFSEDecoderToHeader_RLEFailsClosed(t *testing.T) {
+	initPredefined()
+
+	// A genuinely RLE-mode decoder, built via setRLE exactly as the block decoder
+	// does, with a stale multi-symbol symbolLen left behind (the observed shape).
+	var d fseDecoder
+	d.symbolLen = 3 // stale, as left by a preceding multi-symbol table
+	d.actualTableLog = 11
+	d.norm[0], d.norm[1], d.norm[2] = 100, 200, -1
+	var sym decSymbol
+	sym.setAddBits(0)
+	d.setRLE(sym)
+
+	// setRLE must mark RLE via actualTableLog == 0 while leaving symbolLen stale;
+	// this is precisely why symbolLen is not a safe RLE signal.
+	if d.actualTableLog != 0 {
+		t.Fatalf("setRLE should set actualTableLog 0, got %d", d.actualTableLog)
+	}
+	if d.symbolLen <= 1 {
+		t.Fatalf("test precondition: symbolLen should be stale (>1), got %d -- old guard would have caught it", d.symbolLen)
+	}
+
+	if _, err := fseDecoderToHeader(&d); !errors.Is(err, ErrCheckpointNotSerializable) {
+		t.Fatalf("RLE-mode FSE table: got %v, want ErrCheckpointNotSerializable", err)
+	}
+}
+
+// TestFSEDecoderToHeader_WriteCountFailsClosed proves the belt-and-suspenders
+// mapping: even a decoder that passes the actualTableLog guard but whose
+// distribution writeCount cannot serialize surfaces the sentinel, never a raw
+// internal error string.
+func TestFSEDecoderToHeader_WriteCountFailsClosed(t *testing.T) {
+	var d fseDecoder
+	d.actualTableLog = 5 // tableSize 32, passes the RLE (== 0) guard
+	d.symbolLen = 4
+	// A normalized count that sums to far more than tableSize, which writeCount
+	// rejects (remaining underflows). Must NOT escape as a raw error.
+	d.norm[0], d.norm[1], d.norm[2], d.norm[3] = 100, 100, 100, 100
+	if _, err := fseDecoderToHeader(&d); !errors.Is(err, ErrCheckpointNotSerializable) {
+		t.Fatalf("unserializable distribution: got %v, want ErrCheckpointNotSerializable", err)
+	}
+}
+
+// rleProneContent builds content that makes a high-compression encoder emit
+// reused RLE-mode FSE tables at interior boundaries while still establishing a
+// genuine multi-symbol Huffman table for literals: varied literal bytes (so
+// literals need a real Huffman table) interleaved with fixed-length back
+// references (so the match-length distribution collapses to a single value, i.e.
+// an RLE match-length FSE table). This is the shape on which `zstd -19` returned
+// a raw `writeCount: internal error` before the fix.
+func rleProneContent(n int) []byte {
+	alpha := make([]byte, 0, 180)
+	for c := 10; c < 190; c++ {
+		alpha = append(alpha, byte(c))
+	}
+	r := newSplitmix(55)
+	seed := make([]byte, 16384)
+	for i := range seed {
+		seed[i] = alpha[r.intn(len(alpha))]
+	}
+	out := append([]byte{}, seed...)
+	const matchLen = 64 // fixed -> RLE match-length distribution
+	for len(out) < n {
+		litLen := 2 + r.intn(6)
+		for j := 0; j < litLen; j++ {
+			out = append(out, alpha[r.intn(len(alpha))])
+		}
+		start := r.intn(len(seed) - matchLen)
+		out = append(out, seed[start:start+matchLen]...)
+	}
+	return out[:n]
+}
+
+// hasReusedRLEFSEBoundary reports whether frame has at least one interior
+// checkpoint candidate (next block reuses entropy, Huffman established) whose live
+// FSE tables include an RLE-mode one -- the boundary that exercises the fix.
+func hasReusedRLEFSEBoundary(t *testing.T, frame []byte) (countRLE, countCand int) {
+	t.Helper()
+	fi, err := firstFrame(frame)
+	if err != nil {
+		t.Fatalf("firstFrame: %v", err)
+	}
+	walkErr := walkCheckpoints(fi.body, fi.windowSize, func(cp checkpointState) error {
+		if cp.blockIndex == 0 || cp.compOffset >= len(fi.body) || !cp.reusesEntropy || cp.huff == nil {
+			return nil
+		}
+		countCand++
+		for _, sd := range []*sequenceDec{&cp.seqDecs.litLengths, &cp.seqDecs.offsets, &cp.seqDecs.matchLengths} {
+			if sd.fse != nil && sd.fse.actualTableLog == 0 {
+				countRLE++
+				break
+			}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("walkCheckpoints: %v", walkErr)
+	}
+	return countRLE, countCand
+}
+
+// TestCheckpoints_ReusedRLEFSE_ZstdCLI is the end-to-end regression for the
+// reused-RLE-mode FSE table case on a real `zstd -19` frame. Before the fix,
+// Checkpoints returned a raw `writeCount: internal error` and zero checkpoints on
+// this content; after the fix it skips the unserializable boundaries and returns
+// the usable subset, each of which resumes byte-identically. Skips if the zstd CLI
+// is unavailable (the unit tests above cover the fix deterministically).
+func TestCheckpoints_ReusedRLEFSE_ZstdCLI(t *testing.T) {
+	zstdBin, err := exec.LookPath("zstd")
+	if err != nil {
+		t.Skip("zstd CLI not available")
+	}
+	content := rleProneContent(6_000_000)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "input.bin")
+	dst := filepath.Join(dir, "input.bin.zst")
+	if err := os.WriteFile(src, content, 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	if out, err := exec.Command(zstdBin, "-19", "-q", "-f", "-o", dst, src).CombinedOutput(); err != nil {
+		t.Fatalf("zstd CLI: %v: %s", err, out)
+	}
+	frame, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read compressed: %v", err)
+	}
+
+	countRLE, countCand := hasReusedRLEFSEBoundary(t, frame)
+	t.Logf("checkpoint candidates=%d, of which with an RLE-mode FSE table=%d", countCand, countRLE)
+	if countRLE == 0 {
+		t.Skip("this zstd build did not emit a reused RLE-mode FSE table for the fixture; unit tests cover the fix")
+	}
+
+	// (a) Checkpoints succeeds (no raw error) and returns a usable subset, each
+	// resuming byte-identically against an independent full DecodeAll.
+	cps, err := Checkpoints(frame, 0x99)
+	if err != nil {
+		t.Fatalf("Checkpoints returned an error on a valid frame: %v", err)
+	}
+	if len(cps) == 0 {
+		t.Fatalf("Checkpoints returned no usable checkpoints despite non-RLE boundaries")
+	}
+	full := fullDecode(t, frame)
+	for _, cp := range cps {
+		dec, err := NewReader(nil, WithDecoderDicts(cp.Dictionary))
+		if err != nil {
+			t.Fatalf("NewReader: %v", err)
+		}
+		tail, err := dec.DecodeAll(cp.ResumeFrame, nil)
+		dec.Close()
+		if err != nil {
+			t.Fatalf("DecodeAll(ResumeFrame) at block %d: %v", cp.BlockIndex, err)
+		}
+		if !bytes.Equal(tail, full[cp.UncompressedOffset:]) {
+			t.Fatalf("resume tail mismatch at block %d: firstDiff=%d",
+				cp.BlockIndex, firstDiff(tail, full[cp.UncompressedOffset:]))
+		}
+	}
+
+	// (b) CheckpointAt on a known RLE-mode-FSE boundary returns the sentinel
+	// (matchable with errors.Is), never a raw internal error.
+	fi, _ := firstFrame(frame)
+	rleBoundary := -1
+	walkCheckpoints(fi.body, fi.windowSize, func(cp checkpointState) error {
+		if rleBoundary >= 0 || cp.blockIndex == 0 || cp.compOffset >= len(fi.body) || !cp.reusesEntropy || cp.huff == nil {
+			return nil
+		}
+		for _, sd := range []*sequenceDec{&cp.seqDecs.litLengths, &cp.seqDecs.offsets, &cp.seqDecs.matchLengths} {
+			if sd.fse != nil && sd.fse.actualTableLog == 0 {
+				rleBoundary = cp.blockIndex
+				break
+			}
+		}
+		return nil
+	})
+	if rleBoundary < 0 {
+		t.Fatalf("expected an RLE-mode FSE boundary but found none")
+	}
+	if _, err := CheckpointAt(frame, 0x99, rleBoundary); !errors.Is(err, ErrCheckpointNotSerializable) {
+		t.Fatalf("CheckpointAt on RLE-mode FSE boundary %d: got %v, want ErrCheckpointNotSerializable", rleBoundary, err)
+	}
+}
