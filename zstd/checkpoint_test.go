@@ -1128,3 +1128,325 @@ func TestCheckpoints_ReusedRLEFSE_ZstdCLI(t *testing.T) {
 		t.Fatalf("CheckpointAt on RLE-mode FSE boundary %d: got %v, want ErrCheckpointNotSerializable", rleBoundary, err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Hardening: window descriptor edges, large windows, single-segment, boundary
+// extremes.
+// ---------------------------------------------------------------------------
+
+// TestWindowDescriptor_Edges checks windowDescriptor returns the smallest byte
+// whose decoded window covers the request, decoded exactly as the frame format
+// specifies, across exact powers of two and the mantissa steps between them.
+func TestWindowDescriptor_Edges(t *testing.T) {
+	decode := func(wd byte) uint64 {
+		windowLog := 10 + uint(wd>>3)
+		base := uint64(1) << windowLog
+		return base + (base/8)*uint64(wd&7)
+	}
+	// The exact representable window sizes, in increasing order, must each map to
+	// their own descriptor (smallest covering), and want-1 must too.
+	for exp := uint8(0); exp < 20; exp++ {
+		base := uint64(1) << (10 + uint(exp))
+		for mant := uint8(0); mant < 8; mant++ {
+			want := base + (base/8)*uint64(mant)
+			wd := windowDescriptor(want)
+			got := decode(wd)
+			if got < want {
+				t.Fatalf("windowDescriptor(%d)=0x%02x decodes to %d < want", want, wd, got)
+			}
+			// Smallest covering: the descriptor byte is monotonic in window size, so
+			// the previous descriptor (wd-1) must decode to strictly less than want.
+			if wd > 0 {
+				if prev := decode(wd - 1); prev >= want {
+					t.Fatalf("windowDescriptor(%d)=0x%02x not minimal: prev 0x%02x decodes to %d >= want", want, wd, wd-1, prev)
+				}
+			}
+			// want+1 needs a descriptor whose window is strictly larger.
+			if got == want {
+				wd2 := windowDescriptor(want + 1)
+				if decode(wd2) <= want {
+					t.Fatalf("windowDescriptor(%d) did not grow past %d", want+1, want)
+				}
+			}
+		}
+	}
+	// MinWindowSize maps to the minimum descriptor (0 -> 1 KiB window).
+	if wd := windowDescriptor(MinWindowSize); wd != 0 {
+		t.Fatalf("windowDescriptor(MinWindowSize)=0x%02x, want 0", wd)
+	}
+	// Zero want still yields a usable (minimum) window descriptor.
+	if got := decode(windowDescriptor(0)); got < MinWindowSize {
+		t.Fatalf("windowDescriptor(0) window %d < MinWindowSize", got)
+	}
+}
+
+// TestCheckpointAt_BoundaryExtremes checks resume at the first interior boundary
+// (immediately after block 0, blockIndex=1) and the last valid boundary
+// (nBlocks-1), both byte-identical.
+func TestCheckpointAt_BoundaryExtremes(t *testing.T) {
+	frame := encodeKlauspost(t, SpeedBestCompression, mixedContent(t))
+	blocks, _, _, _ := stripFrameHeader(t, frame)
+	infos := walkBlocks(t, blocks)
+	nBlocks := len(infos)
+	if nBlocks < 3 {
+		t.Fatalf("need >= 3 blocks, got %d", nBlocks)
+	}
+	full := fullDecode(t, frame)
+
+	for _, bi := range []int{1, nBlocks - 1} {
+		cp, err := CheckpointAt(frame, 0x2468, bi)
+		if errors.Is(err, ErrCheckpointNotSerializable) {
+			// A non-serializable extreme is acceptable (e.g. block 1 reuses an RLE
+			// table or no Huffman is established yet); just skip it.
+			t.Logf("boundary %d not serializable: %v", bi, err)
+			continue
+		}
+		if err != nil {
+			t.Fatalf("CheckpointAt(%d): %v", bi, err)
+		}
+		dec, _ := NewReader(nil, WithDecoderDicts(cp.Dictionary))
+		tail, derr := dec.DecodeAll(cp.ResumeFrame, nil)
+		dec.Close()
+		if derr != nil {
+			t.Fatalf("resume %d: %v", bi, derr)
+		}
+		if !bytes.Equal(tail, full[cp.UncompressedOffset:]) {
+			t.Fatalf("boundary %d tail mismatch: firstDiff=%d", bi, firstDiff(tail, full[cp.UncompressedOffset:]))
+		}
+	}
+}
+
+// TestCheckpoint_SingleSegmentNoChecksum covers a single-segment frame (no
+// Window_Descriptor byte; window derived from Frame_Content_Size) with no content
+// checksum -- the combination the firstFrame parser must handle for window sizing.
+func TestCheckpoint_SingleSegmentNoChecksum(t *testing.T) {
+	content := mixedContent(t)
+	enc, err := NewWriter(nil,
+		WithEncoderLevel(SpeedBestCompression),
+		WithEncoderCRC(false),
+		WithSingleSegment(true),
+	)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	frame := enc.EncodeAll(content, nil)
+	enc.Close()
+
+	var h Header
+	if err := h.Decode(frame); err != nil {
+		t.Fatalf("Header.Decode: %v", err)
+	}
+	if !h.SingleSegment {
+		t.Skip("encoder did not produce a single-segment frame for this input")
+	}
+	if h.HasCheckSum {
+		t.Fatalf("expected no checksum")
+	}
+
+	full := fullDecode(t, frame)
+	cps, err := Checkpoints(frame, 0x1357)
+	if err != nil {
+		t.Fatalf("Checkpoints: %v", err)
+	}
+	if len(cps) == 0 {
+		t.Skip("single-segment frame produced no serializable interior boundary")
+	}
+	for _, cp := range cps {
+		dec, _ := NewReader(nil, WithDecoderDicts(cp.Dictionary))
+		tail, derr := dec.DecodeAll(cp.ResumeFrame, nil)
+		dec.Close()
+		if derr != nil {
+			t.Fatalf("resume block %d: %v", cp.BlockIndex, derr)
+		}
+		if !bytes.Equal(tail, full[cp.UncompressedOffset:]) {
+			t.Fatalf("single-segment tail mismatch at block %d", cp.BlockIndex)
+		}
+	}
+}
+
+// TestCheckpoint_LargeWindowCLI covers a real frame with a very large window
+// (`zstd --long`), so the synthesized replay frame must declare a multi-MiB
+// window and still resume byte-identically. Skips if the zstd CLI is unavailable
+// or does not support --long.
+func TestCheckpoint_LargeWindowCLI(t *testing.T) {
+	zstdBin, err := exec.LookPath("zstd")
+	if err != nil {
+		t.Skip("zstd CLI not available")
+	}
+	// Enough varied content across a wide window to span several blocks with long
+	// back-references.
+	content := make([]byte, 0, 12<<20)
+	seed := mixedContent(t)
+	for len(content) < 12<<20 {
+		content = append(content, seed...)
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "in.bin")
+	dst := filepath.Join(dir, "in.bin.zst")
+	if err := os.WriteFile(src, content, 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	// --long=27 -> 128 MiB window, within the decoder's default MaxWindowSize.
+	if out, err := exec.Command(zstdBin, "--long=27", "-19", "-q", "-f", "-o", dst, src).CombinedOutput(); err != nil {
+		t.Skipf("zstd --long unavailable: %v: %s", err, out)
+	}
+	frame, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read compressed: %v", err)
+	}
+
+	var h Header
+	if err := h.Decode(frame); err != nil {
+		t.Fatalf("Header.Decode: %v", err)
+	}
+	// Effective window: for a single-segment frame the window is the content size,
+	// which firstFrame uses as the window for resume sizing.
+	effWindow := h.WindowSize
+	if h.SingleSegment {
+		effWindow = h.FrameContentSize
+	}
+	t.Logf("large-window frame: singleSegment=%v window=%d fcs=%d eff=%d", h.SingleSegment, h.WindowSize, h.FrameContentSize, effWindow)
+	if effWindow < 1<<20 {
+		t.Skipf("effective window %d smaller than expected; skipping", effWindow)
+	}
+
+	full := fullDecode(t, frame)
+	cps, err := Checkpoints(frame, 0xBEEF)
+	if err != nil {
+		t.Fatalf("Checkpoints: %v", err)
+	}
+	if len(cps) == 0 {
+		t.Skip("large-window frame produced no serializable boundary")
+	}
+	tested := 0
+	for _, cp := range cps {
+		rdec, err := NewReader(nil, WithDecoderDicts(cp.Dictionary))
+		if err != nil {
+			t.Fatalf("NewReader(dict): %v", err)
+		}
+		tail, derr := rdec.DecodeAll(cp.ResumeFrame, nil)
+		rdec.Close()
+		if derr != nil {
+			t.Fatalf("resume block %d: %v", cp.BlockIndex, derr)
+		}
+		if !bytes.Equal(tail, full[cp.UncompressedOffset:]) {
+			t.Fatalf("large-window tail mismatch at block %d: firstDiff=%d", cp.BlockIndex, firstDiff(tail, full[cp.UncompressedOffset:]))
+		}
+		tested++
+		if tested >= 6 {
+			break
+		}
+	}
+	t.Logf("large-window: verified %d resumes", tested)
+}
+
+// TestCheckpoint_ExplicitLargeWindow covers a multi-segment frame with an
+// explicit large Window_Descriptor (content larger than the window, so the
+// encoder cannot use single-segment). The synthesized replay frame must declare a
+// window at least this large and resume byte-identically. Deterministic, no CLI.
+func TestCheckpoint_ExplicitLargeWindow(t *testing.T) {
+	const window = 8 << 20
+	// Content several times the window so the frame is not single-segment.
+	content := make([]byte, 0, 5*window)
+	seed := mixedContent(t)
+	for len(content) < 5*window {
+		content = append(content, seed...)
+	}
+	enc, err := NewWriter(nil,
+		WithEncoderLevel(SpeedBestCompression),
+		WithEncoderCRC(true),
+		WithWindowSize(window),
+	)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	frame := enc.EncodeAll(content, nil)
+	enc.Close()
+
+	var h Header
+	if err := h.Decode(frame); err != nil {
+		t.Fatalf("Header.Decode: %v", err)
+	}
+	if h.SingleSegment {
+		t.Skip("encoder chose single-segment; explicit-window case not exercised")
+	}
+	if h.WindowSize < window {
+		t.Fatalf("window %d < requested %d", h.WindowSize, window)
+	}
+	t.Logf("explicit-window frame: window=%d", h.WindowSize)
+
+	full := fullDecode(t, frame)
+	cps, err := Checkpoints(frame, 0xF00D)
+	if err != nil {
+		t.Fatalf("Checkpoints: %v", err)
+	}
+	if len(cps) == 0 {
+		t.Fatalf("no serializable boundary in explicit-window frame")
+	}
+	tested := 0
+	for _, cp := range pickCheckpoints(cps, 8) {
+		rdec, err := NewReader(nil, WithDecoderDicts(cp.Dictionary))
+		if err != nil {
+			t.Fatalf("NewReader(dict): %v", err)
+		}
+		tail, derr := rdec.DecodeAll(cp.ResumeFrame, nil)
+		rdec.Close()
+		if derr != nil {
+			t.Fatalf("resume block %d: %v", cp.BlockIndex, derr)
+		}
+		if !bytes.Equal(tail, full[cp.UncompressedOffset:]) {
+			t.Fatalf("explicit-window tail mismatch at block %d: firstDiff=%d", cp.BlockIndex, firstDiff(tail, full[cp.UncompressedOffset:]))
+		}
+		tested++
+	}
+	t.Logf("explicit-window: verified %d resumes", tested)
+}
+
+// pickCheckpoints returns up to n roughly-evenly-spaced checkpoints.
+func pickCheckpoints(cps []Checkpoint, n int) []Checkpoint {
+	if len(cps) <= n {
+		return cps
+	}
+	out := make([]Checkpoint, 0, n)
+	step := float64(len(cps)) / float64(n)
+	for i := 0; i < n; i++ {
+		out = append(out, cps[int(float64(i)*step)])
+	}
+	return out
+}
+
+// TestBlockReusesEntropy_TruncatedRLELiterals is a regression for a header-scanner
+// panic the fuzzer surfaced: a compressed block declaring RLE literals whose size
+// header consumed every remaining byte left nothing for the mandatory RLE literal
+// byte, and the unchecked in = in[1:] advance sliced out of range. The scanner
+// must fail closed with a clean error on this and every truncated shape, never
+// panic.
+func TestBlockReusesEntropy_TruncatedRLELiterals(t *testing.T) {
+	// Cases: RLE literals with sizeFormat 0/2 (1-byte header), 1 (2-byte), 3
+	// (3-byte), each leaving no byte for the RLE literal.
+	cases := [][]byte{
+		// block header (last=1, type=Compressed=2): bh = 1 | (2<<1) | (cSize<<3)
+		mkCompressedBlock(t, []byte{0x01}),       // litType RLE, sizeFormat 0, 1-byte hdr, no RLE byte
+		mkCompressedBlock(t, []byte{0x09}),       // sizeFormat 2 (0b10<<2 | 01) packs to 1-byte hdr family
+		mkCompressedBlock(t, []byte{0x05, 0x00}), // sizeFormat 1, 2-byte hdr, no RLE byte
+		mkCompressedBlock(t, []byte{0x0d, 0, 0}), // sizeFormat 3, 3-byte hdr, no RLE byte
+	}
+	for i, body := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("case %d: panic on truncated RLE literals: %v", i, r)
+				}
+			}()
+			// Must return a clean (error or boolean) result, never panic.
+			_, _ = blockReusesEntropy(body)
+		}()
+	}
+}
+
+// mkCompressedBlock wraps a compressed-block body in a last-block header.
+func mkCompressedBlock(t *testing.T, body []byte) []byte {
+	t.Helper()
+	bh := uint32(1) | (uint32(blockTypeCompressed) << 1) | (uint32(len(body)) << 3)
+	return append([]byte{byte(bh), byte(bh >> 8), byte(bh >> 16)}, body...)
+}

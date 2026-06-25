@@ -483,6 +483,9 @@ func compressedReusesEntropy(in []byte) (bool, error) {
 				}
 				in = in[regen:]
 			} else {
+				if len(in) < 1 {
+					return false, errors.New("zstd: truncated RLE literal")
+				}
 				in = in[1:]
 			}
 		case 1:
@@ -497,6 +500,9 @@ func compressedReusesEntropy(in []byte) (bool, error) {
 				}
 				in = in[regen:]
 			} else {
+				if len(in) < 1 {
+					return false, errors.New("zstd: truncated RLE literal")
+				}
 				in = in[1:]
 			}
 		case 3:
@@ -511,6 +517,9 @@ func compressedReusesEntropy(in []byte) (bool, error) {
 				}
 				in = in[regen:]
 			} else {
+				if len(in) < 1 {
+					return false, errors.New("zstd: truncated RLE literal")
+				}
 				in = in[1:]
 			}
 		}
